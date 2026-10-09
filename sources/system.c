@@ -613,83 +613,103 @@ static inline int od_config_listen_host_cmp(char *host_listen,
 	return strcmp(host_listen, host_server);
 }
 
-void od_system_config_reload(od_system_t *system)
+typedef struct {
+	/* Borrowed listener; prepare and apply currently run synchronously. */
+	od_system_server_t *server;
+	/* Borrowed from the candidate config. */
+	od_config_listen_t *listen_config;
+	machine_tls_t *tls;
+	int files_changed;
+} od_system_reload_tls_t;
+
+typedef struct {
+	od_config_t config;
+	od_rules_t rules;
+	od_hba_rules_t hba_rules;
+	mm_vector_t tls;
+	int promhttp_server_port;
+} od_system_reload_t;
+
+static void od_system_reload_tls_free(void *element)
+{
+	od_system_reload_tls_t *entry = element;
+	if (entry->tls != NULL) {
+		machine_tls_free(entry->tls);
+	}
+}
+
+static void od_system_reload_init(od_system_reload_t *reload)
+{
+	od_config_init(&reload->config);
+	od_rules_init(&reload->rules);
+	od_hba_rules_init(&reload->hba_rules);
+	mm_vector_init(&reload->tls, sizeof(od_system_reload_tls_t),
+		       od_system_reload_tls_free);
+	reload->promhttp_server_port = 0;
+}
+
+static void od_system_reload_free(od_system_reload_t *reload)
+{
+	mm_vector_destroy(&reload->tls);
+	od_config_free(&reload->config);
+	od_hba_rules_free(&reload->hba_rules);
+	od_rules_cleanup(&reload->rules);
+	od_rules_free(&reload->rules);
+}
+
+static int od_system_reload_prepare(od_system_t *system,
+				    od_system_reload_t *reload)
 {
 	od_instance_t *instance = system->global->instance;
 	od_router_t *router = system->global->router;
-	od_hba_t *hba = system->global->hba;
 	od_list_t *i;
 
-	od_log(&instance->logger, "config", NULL, NULL,
-	       "importing changes from '%s'", instance->config_file);
-
-	od_rules_lock(&router->rules);
-
-	od_rules_stop_checkers(&router->rules);
-
-	od_config_t config;
-	od_config_init(&config);
-
-	od_rules_t rules;
-	od_rules_init(&rules);
-
-	od_hba_rules_t hba_rules;
-	od_hba_rules_init(&hba_rules);
-
 	int rc;
-	rc = od_cfg_import(&instance->logger, &config, &rules, system->global,
-			   &hba_rules, instance->config_file);
+	rc = od_cfg_import(&instance->logger, &reload->config, &reload->rules,
+			   system->global, &reload->hba_rules,
+			   instance->config_file, &reload->promhttp_server_port);
 	if (rc == -1) {
-		goto error;
+		return -1;
 	}
 
-	rc = od_config_validate(&config, &instance->logger);
+	rc = od_config_validate(&reload->config, &instance->logger);
 	if (rc == -1) {
-		goto error;
+		return -1;
 	}
 
-	rc = od_rules_validate(&rules, &config, &instance->logger);
+	rc = od_rules_validate(&reload->rules, &reload->config,
+			       &instance->logger);
 	if (rc == -1) {
-		goto error;
+		return -1;
 	}
-	od_config_reload(&instance->config, &config);
-	od_logger_set_debug(&instance->logger, instance->config.log_debug,
-			    instance->config.log_debug_sampling);
-	od_hba_reload(hba, &hba_rules);
 
 	/* auto-generate default rule for auth_query if none specified */
-	rc = od_rules_autogenerate_defaults(&rules, &instance->logger);
-
-	od_rules_sort_for_matching(&rules);
-
+	rc = od_rules_autogenerate_defaults(&reload->rules, &instance->logger);
 	if (rc == -1) {
-		goto error;
+		return -1;
 	}
 
-	/*
-	 * Merge storages: reuse unchanged storages (keeping their watchdogs
-	 * and endpoint statuses alive), move new/changed storages into
-	 * router->rules, and unref removed/changed ones.  Running
-	 * watchdogs keep their storages alive via refcount and stop
-	 * automatically when the last non-watchdog ref is dropped.  After
-	 * this, rules in the freshly parsed config reference the correct
-	 * storages, so od_rules_merge can compare origin->storage and
-	 * rule->storage by pointer.
-	 */
-	od_rules_storage_merge(&router->rules, &rules);
+	if (od_rules_sort_for_matching(&reload->rules) != 0) {
+		od_error(&instance->logger, "reload-config", NULL, NULL,
+			 "failed to sort configuration rules");
+		return -1;
+	}
 
-	od_rules_unlock(&router->rules);
-
-	machine_tls_cache_invalidate();
-
-	/* Reload TLS certificates */
+	/* Prepare TLS replacements without changing live listeners. */
 	od_list_foreach (&router->servers, i) {
 		od_system_server_t *server;
 		od_config_listen_t *listen_config = NULL;
 		server = od_container_of(i, od_system_server_t, link);
+		if (mm_vector_append(&reload->tls, NULL) != 0) {
+			od_error(&instance->logger, "reload-config", NULL, NULL,
+				 "failed to allocate tls reload entry");
+			return -1;
+		}
+		od_system_reload_tls_t *entry = mm_vector_back(&reload->tls);
+		entry->server = server;
 
 		od_list_t *j;
-		od_list_foreach (&config.listen, j) {
+		od_list_foreach (&reload->config.listen, j) {
 			listen_config =
 				od_container_of(j, od_config_listen_t, link);
 			if (listen_config->port == server->config->port &&
@@ -704,19 +724,7 @@ void od_system_config_reload(od_system_t *system)
 
 		char *host_name = od_config_listen_host_name(server->config);
 
-		if (listen_config == NULL) {
-			od_log(&instance->logger, "reload-config", NULL, NULL,
-			       "failed to match listen config for %s:%d",
-			       host_name, server->config->port);
-		} else if (server->config->tls_opts->tls_mode !=
-			   listen_config->tls_opts->tls_mode) {
-			od_log(&instance->logger, "reload-config", NULL, NULL,
-			       "reloaded tls mode for %s:%d", host_name,
-			       server->config->port);
-
-			server->config->tls_opts->tls_mode =
-				listen_config->tls_opts->tls_mode;
-		}
+		entry->listen_config = listen_config;
 
 		/* build tls from the new config, so that changed cert paths apply */
 		od_config_listen_t *tls_source =
@@ -726,7 +734,7 @@ void od_system_config_reload(od_system_t *system)
 			continue;
 		}
 
-		int files_changed =
+		entry->files_changed =
 			listen_config != NULL &&
 			!od_tls_opts_files_eq(server->config->tls_opts,
 					      listen_config->tls_opts);
@@ -743,21 +751,79 @@ void od_system_config_reload(od_system_t *system)
 			continue;
 		}
 
-		machine_tls_t *tls = od_tls_frontend(tls_source);
-		if (tls == NULL) {
+		entry->tls = od_tls_frontend(tls_source);
+		if (entry->tls == NULL) {
 			od_error(
 				&instance->logger, "reload-config", NULL, NULL,
 				"failed to build tls handler for %s:%d, keeping previous certificate",
 				host_name, server->config->port);
 			continue;
 		}
+	}
 
-		/*
-		 * The replaced handle stays alive until shutdown: clients
-		 * accepted earlier still point at it.
-		 */
+	return 0;
+}
+
+static int od_system_reload_apply(od_system_t *system,
+				  od_system_reload_t *reload)
+{
+	od_instance_t *instance = system->global->instance;
+	od_router_t *router = system->global->router;
+
+#ifdef PROMHTTP_FOUND
+	if (reload->promhttp_server_port > 0 &&
+	    od_prom_set_port(reload->promhttp_server_port,
+			     system->global->cron->metrics) != OK_RESPONSE) {
+		od_error(&instance->logger, "reload-config", NULL, NULL,
+			 "can't set prom http server port %d",
+			 reload->promhttp_server_port);
+		return -1;
+	}
+#endif
+
+	od_rules_lock(&router->rules);
+	od_rules_stop_checkers(&router->rules);
+
+	od_config_reload(&instance->config, &reload->config);
+	od_logger_set_debug(&instance->logger, instance->config.log_debug,
+			    instance->config.log_debug_sampling);
+	od_hba_reload(system->global->hba, &reload->hba_rules);
+
+	/*
+	 * Reuse unchanged storages, preserving watchdogs and endpoint status.
+	 * Move changed/new storages into router->rules and re-point candidate
+	 * rules so the subsequent rules merge can compare storage pointers.
+	 */
+	od_rules_storage_merge(&router->rules, &reload->rules);
+	od_rules_unlock(&router->rules);
+
+	machine_tls_cache_invalidate();
+
+	for (size_t n = 0; n < mm_vector_size(&reload->tls); n++) {
+		od_system_reload_tls_t *entry = mm_vector_get(&reload->tls, n);
+		od_system_server_t *server = entry->server;
+		od_config_listen_t *listen_config = entry->listen_config;
+		char *host_name = od_config_listen_host_name(server->config);
+
+		if (listen_config == NULL) {
+			od_log(&instance->logger, "reload-config", NULL, NULL,
+			       "failed to match listen config for %s:%d",
+			       host_name, server->config->port);
+		} else if (server->config->tls_opts->tls_mode !=
+			   listen_config->tls_opts->tls_mode) {
+			od_log(&instance->logger, "reload-config", NULL, NULL,
+			       "reloaded tls mode for %s:%d", host_name,
+			       server->config->port);
+			server->config->tls_opts->tls_mode =
+				listen_config->tls_opts->tls_mode;
+		}
+
+		if (entry->tls == NULL) {
+			continue;
+		}
+
+		/* Live clients retain the old handle until shutdown. */
 		if (od_system_server_retire_tls(server) != OK_RESPONSE) {
-			machine_tls_free(tls);
 			od_error(
 				&instance->logger, "reload-config", NULL, NULL,
 				"failed to retire tls handler for %s:%d, keeping previous certificate",
@@ -765,19 +831,17 @@ void od_system_config_reload(od_system_t *system)
 			continue;
 		}
 
-		server->tls = tls;
-
-		if (files_changed) {
+		server->tls = entry->tls;
+		entry->tls = NULL; /* ownership transferred to the listener */
+		if (entry->files_changed) {
 			od_log(&instance->logger, "reload-config", NULL, NULL,
 			       "reloaded tls certificate files for %s:%d",
 			       host_name, server->config->port);
 		}
 	}
 
-	od_config_free(&config);
-
 	if (instance->config.log_config) {
-		od_rules_print(&rules, &instance->logger);
+		od_rules_print(&reload->rules, &instance->logger);
 	}
 
 	/* Merge configuration changes.
@@ -788,7 +852,7 @@ void od_system_config_reload(od_system_t *system)
 	 * Force obsolete clients to disconnect.
 	 */
 	od_log(&instance->logger, "rules", NULL, NULL, "reconfigure rules");
-	int updates = od_router_reconfigure(router, &rules);
+	int updates = od_router_reconfigure(router, &reload->rules);
 
 	/* start watchdogs and group checkers for new/changed storages
 	 * and rules — directly in system thread scheduler */
@@ -800,30 +864,34 @@ void od_system_config_reload(od_system_t *system)
 	od_rules_groups_checkers_run(&instance->logger, &router->rules);
 	od_router_unlock(router);
 
-	/* free unused rules */
-	od_rules_free(&rules);
-
 	od_log(&instance->logger, "rules", NULL, NULL,
 	       "%d routes created/deleted and scheduled for removal", updates);
 
-	/* the file on disk loaded, so a restart would come up on it */
-	atomic_store(&instance->config_load_failed, 0);
-	return;
+	return 0;
+}
 
-error:
-	/*
-	 * Keep running on the config already in memory. The file on disk is
-	 * not usable, so a restart would not come up on it.
-	 */
-	atomic_store(&instance->config_load_failed, 1);
+void od_system_config_reload(od_system_t *system)
+{
+	od_instance_t *instance = system->global->instance;
+	od_system_reload_t reload;
+	od_system_reload_init(&reload);
 
-	od_rules_unlock(&router->rules);
-	od_config_free(&config);
-	od_rules_free(&rules);
+	od_log(&instance->logger, "config", NULL, NULL,
+	       "importing changes from '%s'", instance->config_file);
 
-	od_error(&instance->logger, "reload-config", NULL, NULL,
-		 "failed to load '%s', keeping the running configuration",
-		 instance->config_file);
+	int rc = od_system_reload_prepare(system, &reload);
+	if (rc == 0) {
+		rc = od_system_reload_apply(system, &reload);
+	}
+
+	/* A failed candidate leaves the running configuration in place. */
+	atomic_store(&instance->config_load_failed, rc != 0);
+	if (rc != 0) {
+		od_error(&instance->logger, "reload-config", NULL, NULL,
+			 "failed to load '%s', keeping the running configuration",
+			 instance->config_file);
+	}
+	od_system_reload_free(&reload);
 }
 
 static inline void od_system(void *arg)
