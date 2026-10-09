@@ -14,6 +14,7 @@
 #include <types.h>
 #include <id.h>
 #include <config.h>
+#include <thread_pool.h>
 
 struct od_system_server {
 	mm_io_t *io;
@@ -44,6 +45,7 @@ struct od_system {
 	int64_t sighandler_machine;
 	machine_channel_t *system_channel;
 	od_global_t *global;
+	od_thread_pool_t reload_pool;
 };
 
 od_system_t *od_system_create(void);
