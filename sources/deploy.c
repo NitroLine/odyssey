@@ -43,12 +43,12 @@ int od_deploy(od_client_t *client, char *context)
 	int query_count;
 	query_count = 0;
 
-	char query[OD_QRY_MAX_SZ];
+	char *query = NULL;
 	int query_size;
-	query_size =
-		kiwi_vars_cas(&client->vars, &server->vars, query,
-			      sizeof(query) - 1,
-			      instance->config.smart_search_path_enquoting);
+	query_size = kiwi_vars_cas(&client->vars, &server->vars, &query);
+	if (query_size == -1) {
+		return -1;
+	}
 
 	if (query_size > 0) {
 		query[query_size] = 0;
@@ -56,12 +56,14 @@ int od_deploy(od_client_t *client, char *context)
 		machine_msg_t *msg;
 		msg = kiwi_fe_write_query(NULL, query, query_size);
 		if (msg == NULL) {
+			free(query);
 			return -1;
 		}
 
 		int rc;
 		rc = od_write(&server->io, msg);
 		if (rc == -1) {
+			free(query);
 			return -1;
 		}
 
@@ -73,6 +75,8 @@ int od_deploy(od_client_t *client, char *context)
 	} else {
 		client->server->synced_settings = true;
 	}
+
+	free(query);
 
 	if (query_count > 0) {
 		od_server_sync_request(server, query_count);

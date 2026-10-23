@@ -346,5 +346,5 @@ static inline int kiwi_enquote(char *src, char *dst, int dst_len)
 	return (int)(pos - dst);
 }
 
-int kiwi_vars_cas(kiwi_vars_t *client, kiwi_vars_t *server, char *query,
-		  int query_len, int smart_enquoting);
+/* On success, the caller owns *query; it is NULL if no settings differ. */
+int kiwi_vars_cas(kiwi_vars_t *client, kiwi_vars_t *server, char **query);

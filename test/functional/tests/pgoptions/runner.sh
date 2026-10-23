@@ -27,8 +27,18 @@ mkdir -p /tests/pgoptions/results/
 # check_file invalid_parameter '-c search_pathh=invalid_name'
 check_file role '-c role=zz'
 check_file several_params ' -c role=zz  --search_path=public   -c statement_timeout=1337   --work-mem=765MB    '
-check_file search_paths '--search-path="$user",public,popis'
-check_file search_path_injection '--search-path=public;create/**/table/**/zzz()'
+check_file search_paths '--search-path="$user",\ public,\ popis'
+check_file search_path_injection '--search-path="public;create/**/table/**/zzz()"'
 check_file spqrguard '-c spqrguard.prevent_distributed_table_modify=on  -c spqrguard.prevent_reference_table_modify=off'
+
+python3 /tests/pgoptions/search_path.py
+
+ody-stop
+
+sed 's/smart_search_path_enquoting yes/smart_search_path_enquoting no/' \
+    /tests/pgoptions/odyssey.conf > /tmp/odyssey-pgoptions.conf
+/usr/bin/odyssey /tmp/odyssey-pgoptions.conf
+sleep 1
+python3 /tests/pgoptions/search_path.py
 
 ody-stop
