@@ -94,7 +94,7 @@ megabytes) and is rejected by time-valued options.
 | `bindwith_reuseport`                       | int (bool)       | `yes`        | restart | Use SO\_REUSEPORT for binding                         |
 | `max_sigterms_to_die`                      | int              | `3`         | SIGHUP  | Max SIGTERMs before hard exit                         |
 | `enable_host_watcher`                      | int(bool)        | `3`         | restart | Start host cpu and mem consumption watcher thread      |
-| `smart_search_path_enquoting`              | int(bool)        | `no`        | SIGHUP | Compatibility option; `search_path` restoration is automatic      |
+| `smart_search_path_enquoting`              | int(bool)        | `no`        | SIGHUP | Use direct SET for safe `search_path` values      |
 | `log_async`                                | int (bool)       | `yes`       | SIGHUP  | Write log messages asynchronously                                 |
 | `log_queue_depth`                          | int              | `30000`     | SIGHUP  | Max pending messages in async log queue                           |
 | `external_auth_socket_path`                | string           | unset       | restart | Unix socket path for external auth module                         |
@@ -676,17 +676,22 @@ Start thread to watch host CPU and memory consumption. Makes `show host_utilizat
 ## **smart_search_path_enquoting**
 *yes/no*
 
-Accepted for configuration compatibility; this option no longer changes behavior.
-Odyssey automatically uses `SET search_path` with a separate SQL string literal
-for each name in a simple ASCII identifier list. Other values are restored with
-`pg_catalog.set_config()`. Both paths preserve the schema search order; `SET` can
-normalize whitespace and identifier quoting. Long lists are supported, while
-individual names longer than 63 bytes use `set_config()`.
+When enabled, Odyssey restores safe `search_path` values directly with `SET`,
+without wrapping the whole list in a string literal. This preserves support for
+schema lists and quoted identifiers, including spaces and doubled double quotes.
 
-This applies to both client startup options and parameter changes reported by
-the backend, independently of this compatibility option's value.
+Other values, or all values when this option is disabled, are restored with
+`pg_catalog.set_config()`. This avoids interpreting a whole list as one schema
+name. Long lists are supported; individual names longer than 63 bytes use
+`set_config()` to preserve the original value.
+
+This applies to client startup options and parameter changes reported by the
+backend. PostgreSQL may normalize whitespace and identifier quoting in `SET`;
+Odyssey retains the backend-confirmed value after successful restoration.
 
 Default is `no`.
+
+`smart_search_path_enquoting yes`
 
 ## **log\_async**
 *yes|no*

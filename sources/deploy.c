@@ -45,7 +45,9 @@ int od_deploy(od_client_t *client, char *context)
 
 	char *query = NULL;
 	int query_size;
-	query_size = kiwi_vars_cas(&client->vars, &server->vars, &query);
+	query_size =
+		kiwi_vars_cas(&client->vars, &server->vars, &query,
+			      instance->config.smart_search_path_enquoting);
 	if (query_size == -1) {
 		return -1;
 	}
@@ -81,7 +83,22 @@ int od_deploy(od_client_t *client, char *context)
 	if (query_count > 0) {
 		od_server_sync_request(server, query_count);
 
-		return complete_deploy(instance, server, context);
+		if (complete_deploy(instance, server, context) != OK_RESPONSE) {
+			return -1;
+		}
+
+		/* SET can normalize quoting and spaces. Cache the confirmed value,
+		 * but leave unreported parameters (e.g. upstream PG16) untouched. */
+		kiwi_var_t *client_path =
+			kiwi_vars_get(&client->vars, KIWI_VAR_SEARCH_PATH);
+		kiwi_var_t *server_path =
+			kiwi_vars_get(&server->vars, KIWI_VAR_SEARCH_PATH);
+		if (client_path && server_path &&
+		    !kiwi_var_compare(client_path, server_path)) {
+			return kiwi_var_set(client_path, KIWI_VAR_SEARCH_PATH,
+					    server_path->value,
+					    server_path->value_len);
+		}
 	}
 
 	return OK_RESPONSE;

@@ -8,128 +8,109 @@
 
 #include <limits.h>
 
-static inline int kiwi_search_path_ident_char(unsigned char c)
+static inline int find_id_end(const char *str, int len, int pos)
 {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-	       (c >= '0' && c <= '9') || c == '_' || c == '$';
+	/*
+	 * return the end position of id
+	 *
+	 * https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-DOLLAR-QUOTING
+	 * https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS
+	 */
+
+	static const char *id_start_alphabet =
+		"qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM_";
+	static const char *identifier_alphabet =
+		"qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM_0123456789";
+
+	if (pos >= len) {
+		return pos;
+	}
+
+	/* must start with letter or _ */
+	if (strchr(id_start_alphabet, str[pos]) == NULL) {
+		return pos;
+	}
+
+	++pos;
+
+	while (pos < len && strchr(identifier_alphabet, str[pos]) != NULL) {
+		++pos;
+	}
+
+	return pos;
 }
 
-typedef struct {
-	const char *value;
-	int len;
-	int quoted;
-} kiwi_search_path_ident_t;
-
-/* Only simple ASCII identifiers; complex forms use set_config instead. */
-static int kiwi_search_path_next(const char **cursor,
-				 kiwi_search_path_ident_t *name)
+static inline int is_safe_param(const char *str, int len)
 {
-	const char *value = *cursor;
-	if (value == NULL) {
-		return 0;
-	}
-	while (*value == ' ') {
-		value++;
-	}
-	name->quoted = *value == '"';
-	if (name->quoted) {
-		value++;
-	} else if (!((*value >= 'a' && *value <= 'z') ||
-		     (*value >= 'A' && *value <= 'Z') || *value == '_')) {
-		return -1;
-	}
-	name->value = value;
-	while (kiwi_search_path_ident_char((unsigned char)*value)) {
-		if (value - name->value == 63) {
-			return -1;
-		}
-		value++;
-	}
-	name->len = value - name->value;
-	if (name->len == 0 || (name->quoted && *value != '"')) {
-		return -1;
-	}
-	if (name->quoted) {
-		value++;
-	}
-	while (*value == ' ') {
-		value++;
-	}
-	if (*value != 0 && *value != ',') {
-		return -1;
-	}
-	*cursor = *value == ',' ? value + 1 : NULL;
-	return 1;
-}
-
-static inline char kiwi_search_path_ident_byte(kiwi_search_path_ident_t *name,
-					       int i)
-{
-	char c = name->value[i];
-	if (!name->quoted && c >= 'A' && c <= 'Z') {
-		c += 'a' - 'A';
-	}
-	return c;
-}
-
-static int kiwi_search_path_equal(const char *left, const char *right)
-{
+	static const char *allowed_alphabet =
+		"qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM_0123456789,$ ";
+	int i = 0;
+	int end = len - 1;
 	for (;;) {
-		kiwi_search_path_ident_t a, b;
-		int a_rc = kiwi_search_path_next(&left, &a);
-		int b_rc = kiwi_search_path_next(&right, &b);
-		if (a_rc == -1 || b_rc == -1 || a_rc != b_rc) {
+		while (i < end && str[i] == ' ') {
+			i++;
+		}
+		if (i >= end) {
 			return 0;
 		}
-		if (a_rc == 0) {
-			return 1;
+		int quoted = str[i] == '"';
+		if (quoted) {
+			i++;
 		}
-		if (a.len != b.len) {
-			return 0;
-		}
-		for (int i = 0; i < a.len; i++) {
-			if (kiwi_search_path_ident_byte(&a, i) !=
-			    kiwi_search_path_ident_byte(&b, i)) {
+		int start = i;
+		int name_len = 0;
+		int closed = !quoted;
+		while (i < end) {
+			char c = str[i];
+			if (quoted && c == '"') {
+				if (i + 1 < end && str[i + 1] == '"') {
+					i++;
+				} else {
+					i++;
+					closed = 1;
+					break;
+				}
+			} else {
+				if (!quoted && (c == ' ' || c == ',')) {
+					break;
+				}
+				if (strchr(allowed_alphabet, c) == NULL) {
+					return 0;
+				}
+				if (!quoted && c == '$') {
+					int id_end =
+						find_id_end(str, end, i + 1);
+					if (id_end < end &&
+					    str[id_end] == '$') {
+						return 0;
+					}
+					/* Still check every byte: '$' must not hide punctuation. */
+				}
+			}
+			if (++name_len > 63) {
 				return 0;
 			}
+			i++;
+		}
+		if (!closed || name_len == 0 ||
+		    (!quoted && name_len == 7 &&
+		     strncasecmp(str + start, "default", 7) == 0)) {
+			return 0;
+		}
+		while (i < end && str[i] == ' ') {
+			i++;
+		}
+		if (i == end) {
+			return 1;
+		}
+		if (str[i++] != ',') {
+			return 0;
 		}
 	}
-}
-
-/* Encode names as separate SQL string literals; NULL only checks syntax. */
-static int kiwi_search_path_to_sql(const char *value, char *query)
-{
-	int pos = 0;
-	int rc;
-	kiwi_search_path_ident_t name;
-	while ((rc = kiwi_search_path_next(&value, &name)) > 0) {
-		if (pos != 0) {
-			if (query) {
-				query[pos] = ',';
-			}
-			pos++;
-		}
-		if (query) {
-			memcpy(query + pos, "E'", 2);
-		}
-		pos += 2;
-		for (int i = 0; i < name.len; i++) {
-			if (query) {
-				query[pos] =
-					kiwi_search_path_ident_byte(&name, i);
-			}
-			pos++;
-		}
-		if (query) {
-			query[pos] = '\'';
-		}
-		pos++;
-	}
-	return rc == -1 ? -1 : pos;
 }
 
 static int kiwi_var_cas(kiwi_var_t *var, kiwi_var_t *server_var, char **query,
-			int pos)
+			int pos, int smart_enquoting_search_path)
 {
 	if (var->type == KIWI_VAR_UNDEF || kiwi_var_compare(var, server_var)) {
 		return pos;
@@ -138,18 +119,14 @@ static int kiwi_var_cas(kiwi_var_t *var, kiwi_var_t *server_var, char **query,
 	if (var->value_len <= 0) {
 		return -1;
 	}
-	if (var->type == KIWI_VAR_SEARCH_PATH &&
-	    server_var->type == KIWI_VAR_SEARCH_PATH &&
-	    server_var->value_len > 0 &&
-	    kiwi_search_path_equal(var->value, server_var->value)) {
-		return pos;
-	}
 
 	const char *prefix = "SET ";
 	const char *suffix = ";";
 	int name_len = var->name_len - 1;
 	int search_path = var->type == KIWI_VAR_SEARCH_PATH;
-	if (search_path) {
+	int raw_value = search_path && smart_enquoting_search_path &&
+			is_safe_param(var->value, var->value_len);
+	if (search_path && !raw_value) {
 		prefix = "SELECT pg_catalog.set_config('search_path',";
 		suffix = ",false);";
 		name_len = 0;
@@ -157,10 +134,9 @@ static int kiwi_var_cas(kiwi_var_t *var, kiwi_var_t *server_var, char **query,
 	int prefix_len = strlen(prefix);
 	int suffix_len = strlen(suffix);
 
-	/* SET may add E'' per name; kiwi_enquote needs four spare bytes. */
+	/* Each byte may need escaping; kiwi_enquote needs four spare bytes. */
 	uint64_t size = (uint64_t)pos + prefix_len + name_len +
-			(name_len != 0) +
-			(search_path ? 3 : 2) * (uint64_t)(var->value_len - 1) +
+			(name_len != 0) + 2 * (uint64_t)(var->value_len - 1) +
 			2 + 4 + suffix_len;
 	/* kiwi_fe_write_query also adds a terminating NUL and Query header. */
 	if (size > INT_MAX - sizeof(kiwi_header_t) - 1) {
@@ -172,16 +148,6 @@ static int kiwi_var_cas(kiwi_var_t *var, kiwi_var_t *server_var, char **query,
 	}
 	*query = buffer;
 
-	int simple_len =
-		search_path ? kiwi_search_path_to_sql(var->value, NULL) : -1;
-	if (simple_len >= 0) {
-		prefix = "SET ";
-		suffix = ";";
-		prefix_len = strlen(prefix);
-		suffix_len = strlen(suffix);
-		name_len = var->name_len - 1;
-	}
-
 	memcpy(buffer + pos, prefix, prefix_len);
 	pos += prefix_len;
 	if (name_len != 0) {
@@ -190,8 +156,9 @@ static int kiwi_var_cas(kiwi_var_t *var, kiwi_var_t *server_var, char **query,
 		buffer[pos++] = '=';
 	}
 	int quote_len;
-	if (simple_len >= 0) {
-		quote_len = kiwi_search_path_to_sql(var->value, buffer + pos);
+	if (raw_value) {
+		quote_len = var->value_len - 1;
+		memcpy(buffer + pos, var->value, quote_len);
 	} else {
 		quote_len = kiwi_enquote(var->value, buffer + pos,
 					 (int)size - pos - suffix_len);
@@ -206,7 +173,8 @@ static int kiwi_var_cas(kiwi_var_t *var, kiwi_var_t *server_var, char **query,
 	return pos;
 }
 
-int kiwi_vars_cas(kiwi_vars_t *client, kiwi_vars_t *server, char **query)
+int kiwi_vars_cas(kiwi_vars_t *client, kiwi_vars_t *server, char **query,
+		  int smart_enquoting_search_path)
 {
 	*query = NULL;
 	int pos = 0;
@@ -218,7 +186,8 @@ int kiwi_vars_cas(kiwi_vars_t *client, kiwi_vars_t *server, char **query)
 			continue;
 		}
 		pos = kiwi_var_cas(kiwi_vars_of(client, type),
-				   kiwi_vars_of(server, type), query, pos);
+				   kiwi_vars_of(server, type), query, pos,
+				   smart_enquoting_search_path);
 		if (pos == -1) {
 			goto error;
 		}
@@ -227,7 +196,7 @@ int kiwi_vars_cas(kiwi_vars_t *client, kiwi_vars_t *server, char **query)
 	/* SELECT takes a snapshot: apply transaction settings before it. */
 	pos = kiwi_var_cas(kiwi_vars_of(client, KIWI_VAR_SEARCH_PATH),
 			   kiwi_vars_of(server, KIWI_VAR_SEARCH_PATH), query,
-			   pos);
+			   pos, smart_enquoting_search_path);
 	if (pos == -1) {
 		goto error;
 	}
