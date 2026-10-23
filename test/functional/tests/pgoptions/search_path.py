@@ -23,8 +23,9 @@ def set_path(path):
     return f"SELECT pg_catalog.set_config('search_path', {literal(path)}, false);"
 
 
-def check_path(path, runtime=False, transaction_isolation=False):
+def check_path(path, runtime=False, transaction_isolation=False, normalized=None):
     expected = json.loads(execute(set_path(path) + "\n" + STATE + ";\n", backend)[-1])
+    restored = [normalized if normalized is not None else expected[0], expected[1]]
     env = client.copy()
     startup = "public" if runtime else path
     env["PGOPTIONS"] = "-c search_path=" + startup.replace("\\", "\\\\").replace(" ", "\\ ")
@@ -48,8 +49,11 @@ def check_path(path, runtime=False, transaction_isolation=False):
         result = result[1:]  # The value returned by set_config().
     assert len(result) == 5, result
     assert result[0] == result[2] == result[3], ("backend was not reused", result)
-    assert json.loads(result[1]) == expected, (path, "initial", result, expected)
-    assert json.loads(result[4]) == expected, (path, "restored", result, expected)
+    initial = json.loads(result[1])
+    # A pool reset can restore the path before the first observation.
+    assert initial[0] in (expected[0], restored[0]), (path, "initial", result, expected, restored)
+    assert initial[1] == expected[1], (path, "initial schemas", result, expected)
+    assert json.loads(result[4]) == restored, (path, "restored", result, restored)
 
 
 client = os.environ.copy()
@@ -62,28 +66,60 @@ backend = client.copy()
 backend["PGPORT"] = os.environ.get("ODYSSEY_TEST_POSTGRES_PORT", "5432")
 backend["PGUSER"] = "postgres"
 
-paths = [
-    '"$user",public,popis',
-    "schema01, schema02, schema03, schema04, schema05, schema06, schema07, public",
-    ", ".join(["public"] * 150),
-    '"my-schema", public',
-    '"O\'Reilly", "a\\b", public',
-    '"кириллица", public',
-    '"$user", public',
-    '"$$", "$a$", public',
-    '"public;create/**/table/**/zzz()", public',
-    "",
-]
-for path in paths:
-    check_path(path)
+def identifier(value):
+    return '"' + value.replace('"', '""') + '"'
 
-# Restoring search_path must not take a snapshot before SET transaction_isolation.
-check_path("public", transaction_isolation=True)
 
-# Upstream PostgreSQL started reporting search_path changes in version 18.
-version = int(execute("SHOW server_version_num;\n", backend)[0])
-if version >= 180000:
-    for path in paths:
-        check_path(path, runtime=True)
+prefix = f"odyssey_path_{os.getpid()}"
+schemas = [prefix + suffix for suffix in ["_a", "_b", "_MiXeD", "-dash", "_O'Reilly", '_a"b', "_кириллица"]]
+long_name = (prefix + "_" + "a" * 63)[:63]
+schemas.append(long_name)
+execute("\n".join(f"CREATE SCHEMA {identifier(name)};" for name in schemas), backend)
+try:
+    a, b, mixed, dash, apostrophe, quote, unicode = schemas[:7]
+    paths = [
+        ('"$user",public,popis', '"$user", public, popis'),
+        ("schema01, schema02, schema03, schema04, schema05, schema06, schema07, public", None),
+        (", ".join(["public"] * 150), None),
+        ('"my-schema", public', None),
+        ('"O\'Reilly", "a\\b", public', None),
+        ('"кириллица", public', None),
+        ('"$user", public', None),
+        ('"$$", "$a$", public', None),
+        ('"public;create/**/table/**/zzz()", public', None),
+        ("", None),
+        (f"{a},{b},public", f"{a}, {b}, public"),
+        (f"{a.upper()}, {b}, public", f"{a}, {b}, public"),
+        (f"{identifier(a)}, {b}, public", f"{a}, {b}, public"),
+        (f"{a}, {identifier(mixed)}, public", None),
+        (f"{identifier(dash)}, {b}, public", None),
+        (f"{identifier(apostrophe)}, {b}, public", None),
+        (f"{identifier(quote)}, {b}, public", None),
+        (f"{identifier(unicode)}, {b}, public", None),
+        (f"{long_name}, public", None),
+        (f"{long_name}a, public", None),
+        (f"{identifier(long_name + 'a')}, public", None),
+        ("default, true, all", '"default", "true", "all"'),
+    ]
+    for path, normalized in paths:
+        check_path(path, normalized=normalized)
 
-print(f"search_path restoration passed on PostgreSQL {version}")
+    # The SELECT fallback must run after transaction settings.
+    check_path(f"{identifier(dash)}, public", transaction_isolation=True)
+
+    # Upstream PostgreSQL started reporting search_path changes in version 18.
+    version = int(execute("SHOW server_version_num;\n", backend)[0])
+    if version >= 180000:
+        for path, normalized in paths:
+            check_path(path, runtime=True, normalized=normalized)
+
+    # Unsupported or malformed input must never become another SQL statement.
+    for path in ["public$; SELECT 1 AS x$", "public,", '"unterminated']:
+        env = client.copy()
+        env["PGOPTIONS"] = "-c search_path=" + path.replace("\\", "\\\\").replace(" ", "\\ ")
+        result = subprocess.run(PSQL, input="SELECT 1;\n", env=env, text=True, capture_output=True, timeout=30)
+        assert result.returncode != 0 and not result.stdout, (path, result.stdout, result.stderr)
+
+    print(f"search_path restoration passed on PostgreSQL {version}")
+finally:
+    execute("\n".join(f"DROP SCHEMA {identifier(name)};" for name in schemas), backend)
